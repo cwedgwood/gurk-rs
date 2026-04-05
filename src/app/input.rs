@@ -125,6 +125,52 @@ impl App {
         if key.code != KeyCode::Tab {
             self.mention_cycle = None;
         }
+
+        // Handle mention popup if active
+        if self.mention_popup.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mention_popup = None;
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_mention_popup();
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    if let Some(ref mut popup) = self.mention_popup {
+                        let i = popup.state.selected().unwrap_or(0);
+                        if i > 0 {
+                            popup.state.select(Some(i - 1));
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut popup) = self.mention_popup {
+                        let i = popup.state.selected().unwrap_or(0);
+                        if i + 1 < popup.matches.len() {
+                            popup.state.select(Some(i + 1));
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char(c) => {
+                    self.get_input().put_char(c);
+                    self.update_mention_popup();
+                    return Ok(());
+                }
+                KeyCode::Backspace => {
+                    self.get_input().on_backspace();
+                    self.update_mention_popup();
+                    return Ok(());
+                }
+                _ => {
+                    self.mention_popup = None;
+                }
+            }
+        }
+
         if let Some(cmd) = self.event_to_command(&key) {
             self.on_command(cmd.clone()).await?;
         } else {
@@ -162,7 +208,12 @@ impl App {
                 KeyCode::Esc if !self.reset_editing() => {
                     self.reset_message_selection();
                 }
-                KeyCode::Char(c) => self.get_input().put_char(c),
+                KeyCode::Char(c) => {
+                    self.get_input().put_char(c);
+                    if c == '@' {
+                        self.open_mention_popup();
+                    }
+                }
                 _ => {}
             }
         }
@@ -493,6 +544,139 @@ impl App {
             self.bell();
         }
         true
+    }
+
+    fn open_mention_popup(&mut self) {
+        let at_byte_pos = self.input.cursor.idx - 1; // cursor is after the '@'
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return;
+                }
+            }
+        };
+
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .collect();
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0));
+        self.mention_popup = Some(super::MentionPopupState {
+            at_byte_pos,
+            matches,
+            state,
+        });
+    }
+
+    fn update_mention_popup(&mut self) {
+        let Some(ref popup) = self.mention_popup else {
+            return;
+        };
+        let at_pos = popup.at_byte_pos;
+        let cursor_byte = self.input.cursor.idx;
+
+        // Check if cursor is still after the @
+        if cursor_byte <= at_pos {
+            self.mention_popup = None;
+            return;
+        }
+
+        let partial = &self.input.data[at_pos + 1..cursor_byte];
+        let partial_lower = partial.to_lowercase();
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => {
+                self.mention_popup = None;
+                return;
+            }
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => {
+                self.mention_popup = None;
+                return;
+            }
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    self.mention_popup = None;
+                    return;
+                }
+            }
+        };
+
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .filter(|(name, _)| {
+                partial_lower.is_empty() || name.to_lowercase().starts_with(&partial_lower)
+            })
+            .collect();
+
+        if matches.is_empty() {
+            self.mention_popup = None;
+            return;
+        }
+
+        let popup = self.mention_popup.as_mut().unwrap();
+        popup.matches = matches;
+        // Clamp selection
+        if let Some(sel) = popup.state.selected() {
+            if sel >= popup.matches.len() {
+                popup.state.select(Some(popup.matches.len() - 1));
+            }
+        } else {
+            popup.state.select(Some(0));
+        }
+    }
+
+    fn accept_mention_popup(&mut self) {
+        let Some(popup) = self.mention_popup.take() else {
+            return;
+        };
+        let selected = popup.state.selected().unwrap_or(0);
+        if selected >= popup.matches.len() {
+            return;
+        }
+        let (name, _uuid) = &popup.matches[selected];
+        let cursor_byte = self.input.cursor.idx;
+
+        // Replace @partial with @Name and add space
+        let replace_start = popup.at_byte_pos + 1; // after @
+        let name_and_space = format!("{name} ");
+        self.input
+            .data
+            .replace_range(replace_start..cursor_byte, &name_and_space);
+
+        // Move cursor to after the space
+        self.input.cursor.idx = replace_start;
+        self.input.cursor.col = self.input.data[..replace_start].chars().count();
+        for _ in 0..name_and_space.chars().count() {
+            self.input.on_right();
+        }
     }
 
     /// Cycling tab completion for @mentions.

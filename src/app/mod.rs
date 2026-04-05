@@ -58,6 +58,8 @@ pub struct App {
     timers_activated_for: Option<ChannelId>,
     /// State for cycling @mention tab completion
     mention_cycle: Option<MentionCycleState>,
+    /// State for @mention popup
+    pub(crate) mention_popup: Option<MentionPopupState>,
 }
 
 struct MentionCycleState {
@@ -69,6 +71,15 @@ struct MentionCycleState {
     matches: Vec<String>,
     /// Current cycle index
     index: usize,
+}
+
+pub(crate) struct MentionPopupState {
+    /// Byte position of the '@' in the input
+    pub at_byte_pos: usize,
+    /// Filtered matches: (display name, uuid)
+    pub matches: Vec<(String, Uuid)>,
+    /// Selection state
+    pub state: ratatui::widgets::ListState,
 }
 
 impl App {
@@ -136,6 +147,7 @@ impl App {
             channel_selected_at: std::time::Instant::now(),
             timers_activated_for: None,
             mention_cycle: None,
+            mention_popup: None,
         };
         Ok((app, event_rx))
     }

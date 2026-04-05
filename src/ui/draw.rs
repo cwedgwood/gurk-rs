@@ -74,6 +74,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.select_channel.is_shown {
         draw_select_channel_popup(f, &mut app.select_channel);
     }
+
+    if app.mention_popup.is_some() {
+        draw_mention_popup(f, app);
+    }
 }
 
 fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel) {
@@ -108,6 +112,49 @@ fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel) 
         .block(Block::default().borders(Borders::ALL))
         .highlight_style(Style::default().reversed());
     f.render_stateful_widget(list, chunks[1], &mut select_channel.state);
+}
+
+fn draw_mention_popup(f: &mut Frame, app: &mut App) {
+    let Some(ref mut popup) = app.mention_popup else {
+        return;
+    };
+
+    let names: Vec<ListItem> = popup
+        .matches
+        .iter()
+        .map(|(name, _)| ListItem::new(name.as_str()))
+        .collect();
+
+    if names.is_empty() {
+        return;
+    }
+
+    // Size: width fits longest name (min 20), height capped at half screen
+    let max_width = popup
+        .matches
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(10)
+        .max(10) // minimum usable width
+        + 4; // padding + borders
+    let max_height = (f.area().height / 2) as usize;
+    let height = names.len().min(max_height) + 2; // +2 for borders
+
+    // Position: above the input area, aligned to cursor
+    let area = f.area();
+    let popup_width = (max_width as u16).min(area.width);
+    let popup_height = height as u16;
+    let x = area.x + 1;
+    let y = area.height.saturating_sub(popup_height + 3); // 3 for input box
+
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+    f.render_widget(Clear, popup_area);
+
+    let list = List::new(names)
+        .block(Block::default().borders(Borders::ALL).title("@mention"))
+        .highlight_style(Style::default().reversed());
+    f.render_stateful_widget(list, popup_area, &mut popup.state);
 }
 
 fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
