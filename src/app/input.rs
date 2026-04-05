@@ -77,8 +77,20 @@ impl App {
             }
             Command::React(reaction) => {
                 // Tab with @partial before cursor: attempt mention completion
-                if reaction.is_none() && self.try_mention_completion_cycling() {
-                    return Ok(());
+                if reaction.is_none() {
+                    use crate::config::MentionCompletionStyle;
+                    let completed = match self.config.mention_completion {
+                        MentionCompletionStyle::None => false,
+                        MentionCompletionStyle::Readline => self.try_mention_completion(),
+                        MentionCompletionStyle::Cycle => self.try_mention_completion_cycling(),
+                        MentionCompletionStyle::Menu => {
+                            // Menu mode uses the popup, Tab not needed to trigger
+                            false
+                        }
+                    };
+                    if completed {
+                        return Ok(());
+                    }
                 }
                 if let Some(idx) = self.channels.state.selected() {
                     self.add_reaction(idx, reaction).await;
@@ -210,7 +222,10 @@ impl App {
                 }
                 KeyCode::Char(c) => {
                     self.get_input().put_char(c);
-                    if c == '@' {
+                    if c == '@'
+                        && self.config.mention_completion
+                            == crate::config::MentionCompletionStyle::Menu
+                    {
                         self.open_mention_popup();
                     }
                 }
@@ -686,41 +701,41 @@ impl App {
         let before_cursor = self.input.data[..cursor_byte].to_string();
 
         // Check if we're continuing a cycle
-        if let Some(ref cycle) = self.mention_cycle {
+        let cycle_action = self.mention_cycle.as_ref().and_then(|cycle| {
             let expected_end = cycle.at_byte_pos + 1 + cycle.matches[cycle.index].len();
             if cursor_byte == expected_end {
-                let old_name_len = cycle.matches[cycle.index].len();
-                let new_index = (cycle.index + 1) % cycle.matches.len();
-                let new_name = cycle.matches[new_index].clone();
-                let replace_start = cycle.at_byte_pos + 1;
-                let replace_end = replace_start + old_name_len;
-                let col_at_start = before_cursor[..replace_start].chars().count();
-                let new_name_chars = new_name.chars().count();
-
-                drop(cycle);
-                self.input
-                    .data
-                    .replace_range(replace_start..replace_end, &new_name);
-
-                self.input.cursor.idx = replace_start;
-                self.input.cursor.col = col_at_start;
-                for _ in 0..new_name_chars {
-                    self.input.on_right();
-                }
-
-                self.mention_cycle.as_mut().unwrap().index = new_index;
-                return true;
+                Some((
+                    cycle.matches[cycle.index].len(),
+                    (cycle.index + 1) % cycle.matches.len(),
+                    cycle.matches[(cycle.index + 1) % cycle.matches.len()].clone(),
+                    cycle.at_byte_pos + 1,
+                ))
             } else {
-                // fall through to reset
+                None
             }
+        });
+
+        if let Some((old_name_len, new_index, new_name, replace_start)) = cycle_action {
+            let replace_end = replace_start + old_name_len;
+            let col_at_start = before_cursor[..replace_start].chars().count();
+            let new_name_chars = new_name.chars().count();
+
+            self.input
+                .data
+                .replace_range(replace_start..replace_end, &new_name);
+
+            self.input.cursor.idx = replace_start;
+            self.input.cursor.col = col_at_start;
+            for _ in 0..new_name_chars {
+                self.input.on_right();
+            }
+
+            self.mention_cycle.as_mut().unwrap().index = new_index;
+            return true;
         }
-        // Reset if we didn't continue a cycle
-        if self.mention_cycle.is_some()
-            && !self
-                .mention_cycle
-                .as_ref()
-                .is_some_and(|c| cursor_byte == c.at_byte_pos + 1 + c.matches[c.index].len())
-        {
+
+        // Reset cycle if cursor moved
+        if self.mention_cycle.is_some() {
             self.mention_cycle = None;
         }
 
@@ -785,7 +800,6 @@ impl App {
 
         self.mention_cycle = Some(super::MentionCycleState {
             at_byte_pos: at_pos,
-            partial: partial.to_string(),
             matches,
             index: 0,
         });

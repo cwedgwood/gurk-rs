@@ -60,6 +60,19 @@ pub struct Config {
     /// Whether to enable the default keybindings
     #[serde(default = "default_true")]
     pub default_keybindings: bool,
+    /// @mention completion style: "readline" (default), "cycle", "menu", or "none"
+    #[serde(default)]
+    pub mention_completion: MentionCompletionStyle,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MentionCompletionStyle {
+    None,
+    #[default]
+    Readline,
+    Cycle,
+    Menu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +220,7 @@ impl Config {
             colored_messages: false,
             default_keybindings: true,
             keybindings: ModeKeybindingConfig::default(),
+            mention_completion: Default::default(),
         }
     }
 

@@ -65,8 +65,6 @@ pub struct App {
 struct MentionCycleState {
     /// Byte position of the '@' in the input
     at_byte_pos: usize,
-    /// The original partial text typed after '@'
-    partial: String,
     /// Matched names
     matches: Vec<String>,
     /// Current cycle index
