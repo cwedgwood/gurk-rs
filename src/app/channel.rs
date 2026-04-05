@@ -17,12 +17,10 @@ impl App {
     }
 
     pub fn select_previous_channel(&mut self) {
-        self.reset_unread_messages();
         self.channels.previous();
     }
 
     pub fn select_next_channel(&mut self) {
-        self.reset_unread_messages();
         self.channels.next();
     }
 
