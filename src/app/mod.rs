@@ -56,6 +56,19 @@ pub struct App {
     channel_selected_at: std::time::Instant,
     /// Channel whose message timers have been activated (avoids repeated scanning)
     timers_activated_for: Option<ChannelId>,
+    /// State for cycling @mention tab completion
+    mention_cycle: Option<MentionCycleState>,
+}
+
+struct MentionCycleState {
+    /// Byte position of the '@' in the input
+    at_byte_pos: usize,
+    /// The original partial text typed after '@'
+    partial: String,
+    /// Matched names
+    matches: Vec<String>,
+    /// Current cycle index
+    index: usize,
 }
 
 impl App {
@@ -122,6 +135,7 @@ impl App {
             mode_keybindings,
             channel_selected_at: std::time::Instant::now(),
             timers_activated_for: None,
+            mention_cycle: None,
         };
         Ok((app, event_rx))
     }

@@ -77,7 +77,7 @@ impl App {
             }
             Command::React(reaction) => {
                 // Tab with @partial before cursor: attempt mention completion
-                if reaction.is_none() && self.try_mention_completion() {
+                if reaction.is_none() && self.try_mention_completion_cycling() {
                     return Ok(());
                 }
                 if let Some(idx) = self.channels.state.selected() {
@@ -122,6 +122,9 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        if key.code != KeyCode::Tab {
+            self.mention_cycle = None;
+        }
         if let Some(cmd) = self.event_to_command(&key) {
             self.on_command(cmd.clone()).await?;
         } else {
@@ -489,6 +492,120 @@ impl App {
             }
             self.bell();
         }
+        true
+    }
+
+    /// Cycling tab completion for @mentions.
+    /// First Tab inserts first match. Subsequent Tabs cycle through matches.
+    fn try_mention_completion_cycling(&mut self) -> bool {
+        let cursor_byte = self.input.cursor.idx;
+        let before_cursor = self.input.data[..cursor_byte].to_string();
+
+        // Check if we're continuing a cycle
+        if let Some(ref cycle) = self.mention_cycle {
+            let expected_end = cycle.at_byte_pos + 1 + cycle.matches[cycle.index].len();
+            if cursor_byte == expected_end {
+                let old_name_len = cycle.matches[cycle.index].len();
+                let new_index = (cycle.index + 1) % cycle.matches.len();
+                let new_name = cycle.matches[new_index].clone();
+                let replace_start = cycle.at_byte_pos + 1;
+                let replace_end = replace_start + old_name_len;
+                let col_at_start = before_cursor[..replace_start].chars().count();
+                let new_name_chars = new_name.chars().count();
+
+                drop(cycle);
+                self.input
+                    .data
+                    .replace_range(replace_start..replace_end, &new_name);
+
+                self.input.cursor.idx = replace_start;
+                self.input.cursor.col = col_at_start;
+                for _ in 0..new_name_chars {
+                    self.input.on_right();
+                }
+
+                self.mention_cycle.as_mut().unwrap().index = new_index;
+                return true;
+            } else {
+                // fall through to reset
+            }
+        }
+        // Reset if we didn't continue a cycle
+        if self.mention_cycle.is_some()
+            && !self
+                .mention_cycle
+                .as_ref()
+                .is_some_and(|c| cursor_byte == c.at_byte_pos + 1 + c.matches[c.index].len())
+        {
+            self.mention_cycle = None;
+        }
+
+        // Start a new completion
+        let at_pos = match before_cursor.rfind('@') {
+            Some(pos) => pos,
+            None => return false,
+        };
+        if at_pos > 0 && !before_cursor.as_bytes()[at_pos - 1].is_ascii_whitespace() {
+            return false;
+        }
+
+        let partial = &before_cursor[at_pos + 1..];
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return false,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return false;
+                }
+            }
+        };
+
+        let partial_lower = partial.to_lowercase();
+        let matches: Vec<String> = members
+            .iter()
+            .map(|&uuid| self.name_by_id_cached(uuid))
+            .filter(|name| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+
+        if matches.is_empty() {
+            self.bell();
+            return true;
+        }
+
+        // Insert first match
+        let completion = &matches[0][partial.len()..];
+        let comp_len = completion.len();
+        if matches.len() == 1 {
+            // Unique match: complete and add space
+            let to_insert = format!("{completion} ");
+            self.input.data.insert_str(cursor_byte, &to_insert);
+            for _ in 0..to_insert.chars().count() {
+                self.input.on_right();
+            }
+        } else {
+            self.input.data.insert_str(cursor_byte, completion);
+            for _ in 0..comp_len {
+                self.input.on_right();
+            }
+        }
+
+        self.mention_cycle = Some(super::MentionCycleState {
+            at_byte_pos: at_pos,
+            partial: partial.to_string(),
+            matches,
+            index: 0,
+        });
+
         true
     }
 
