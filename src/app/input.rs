@@ -76,6 +76,10 @@ impl App {
                 self.is_multiline_input = !self.is_multiline_input;
             }
             Command::React(reaction) => {
+                // Tab with @partial before cursor: attempt mention completion
+                if reaction.is_none() && self.try_mention_completion() {
+                    return Ok(());
+                }
                 if let Some(idx) = self.channels.state.selected() {
                     self.add_reaction(idx, reaction).await;
                 }
@@ -394,6 +398,98 @@ impl App {
         }
 
         Some(())
+    }
+
+    /// Attempt bash-style tab completion for @mentions.
+    /// Returns true if completion was attempted (even if no match).
+    fn try_mention_completion(&mut self) -> bool {
+        // Find the @ before the cursor
+        let input = &self.input.data;
+        let cursor_byte = self.input.cursor.idx;
+        let before_cursor = &input[..cursor_byte];
+        let at_pos = match before_cursor.rfind('@') {
+            Some(pos) => pos,
+            None => return false,
+        };
+
+        // Must be at start or after whitespace
+        if at_pos > 0 && !before_cursor.as_bytes()[at_pos - 1].is_ascii_whitespace() {
+            return false;
+        }
+
+        let partial = &before_cursor[at_pos + 1..];
+        if partial.is_empty() {
+            self.bell();
+            return true;
+        }
+
+        // Get channel members
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return false,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return false;
+                }
+            }
+        };
+
+        // Find matching names
+        let partial_lower = partial.to_lowercase();
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .filter(|(name, _)| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+
+        if matches.is_empty() {
+            return true; // attempted but no match
+        }
+
+        if matches.len() == 1 {
+            // Unique match: complete and add space
+            let name = &matches[0].0;
+            let completion = &name[partial.len()..];
+            let insert_pos = cursor_byte;
+            self.input.data.insert_str(insert_pos, completion);
+            self.input.data.insert(insert_pos + completion.len(), ' ');
+            for _ in 0..completion.len() + 1 {
+                self.input.on_right();
+            }
+        } else {
+            // Multiple matches: complete to longest common prefix
+            let first = matches[0].0.to_lowercase();
+            let mut prefix_len = first.len();
+            for (name, _) in &matches[1..] {
+                let name_lower = name.to_lowercase();
+                prefix_len = first
+                    .chars()
+                    .zip(name_lower.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+            }
+            if prefix_len > partial.len() {
+                // Can extend the partial
+                let original_name = &matches[0].0;
+                let completion = &original_name[partial.len()..prefix_len];
+                let insert_pos = cursor_byte;
+                self.input.data.insert_str(insert_pos, completion);
+                for _ in 0..completion.len() {
+                    self.input.on_right();
+                }
+            }
+            self.bell();
+        }
+        true
     }
 
     /// Parse @mentions in the input text and replace with placeholder characters.

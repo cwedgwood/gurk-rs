@@ -873,7 +873,7 @@ impl App {
         }
     }
 
-    fn bell(&self) {
+    pub(super) fn bell(&self) {
         if self.config.bell {
             print!("\x07");
         }
