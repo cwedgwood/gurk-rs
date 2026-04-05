@@ -11,11 +11,12 @@ use image::codecs::png::PngEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgba};
 use presage::libsignal_service::sender::AttachmentSpec;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::command::{
     Command, DirectionVertical, MoveAmountText, MoveAmountVisual, MoveDirection, Widget, WindowMode,
 };
-use crate::data::{ChannelId, Message};
+use crate::data::{AssociatedValue, BodyRange, ChannelId, Message};
 use crate::storage::MessageId;
 use crate::util::{ATTACHMENT_REGEX, URL_REGEX};
 
@@ -274,6 +275,10 @@ impl App {
             .storage
             .channel(channel_id)
             .expect("non-existent channel");
+        let (input, body_ranges) = self.parse_mentions(&channel, input);
+        if !body_ranges.is_empty() || input.contains("XYZZY") {
+            info!(?input, ?body_ranges, "XYZZY mention parse result");
+        }
         let editing = self.editing.take();
         let quote = editing.is_none().then(|| self.selected_message()).flatten();
         let (sent_message, response) = self.signal_manager.send_text(
@@ -282,6 +287,7 @@ impl App {
             quote.as_deref(),
             editing.map(|id| id.arrived_at),
             attachments,
+            body_ranges,
         );
 
         let message_id = MessageId::new(channel_id, sent_message.arrived_at);
@@ -388,6 +394,90 @@ impl App {
         }
 
         Some(())
+    }
+
+    /// Parse @mentions in the input text and replace with placeholder characters.
+    /// Returns the modified text and a list of BodyRanges for the mentions.
+    fn parse_mentions(
+        &self,
+        channel: &crate::data::Channel,
+        input: String,
+    ) -> (String, Vec<BodyRange>) {
+        let members = match channel.group_data.as_ref() {
+            Some(group_data) => &group_data.members,
+            None => {
+                // DM: the only mentionable user is the other party
+                if let ChannelId::User(uuid) = channel.id {
+                    return self.parse_mentions_with_members(&[uuid], input);
+                }
+                return (input, vec![]);
+            }
+        };
+        self.parse_mentions_with_members(members, input)
+    }
+
+    fn parse_mentions_with_members(
+        &self,
+        members: &[Uuid],
+        input: String,
+    ) -> (String, Vec<BodyRange>) {
+        // Build name → UUID map from group members
+        let name_to_uuid: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid).to_lowercase(), uuid))
+            .collect();
+
+        let mut result = String::with_capacity(input.len());
+        let mut body_ranges = Vec::new();
+        let mut chars = input.char_indices().peekable();
+        let mut char_pos: u16 = 0;
+
+        while let Some((i, ch)) = chars.next() {
+            if ch == '@' {
+                // Try to match a member name after @
+                let rest = &input[i + 1..];
+                let mut matched = None;
+                for (name, uuid) in &name_to_uuid {
+                    if rest.to_lowercase().starts_with(name.as_str()) {
+                        // Check the char after the name is a boundary
+                        let after = rest.get(name.len()..name.len() + 1);
+                        if after.is_none()
+                            || after.is_some_and(|c| {
+                                c.starts_with(|c: char| {
+                                    c.is_whitespace() || c.is_ascii_punctuation()
+                                })
+                            })
+                        {
+                            matched = Some((name.len(), *uuid));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((name_len, uuid)) = matched {
+                    let start = char_pos;
+                    result.push('\u{FFFC}');
+                    char_pos += 1;
+                    body_ranges.push(BodyRange {
+                        start,
+                        end: char_pos,
+                        value: AssociatedValue::MentionUuid(uuid),
+                    });
+                    // Skip past the matched name in the input
+                    for _ in 0..name_len {
+                        chars.next();
+                    }
+                } else {
+                    result.push(ch);
+                    char_pos += 1;
+                }
+            } else {
+                result.push(ch);
+                char_pos += 1;
+            }
+        }
+
+        (result, body_ranges)
     }
 
     pub fn event_to_command<'r>(&'r self, event: &KeyEvent) -> Option<&'r Command> {

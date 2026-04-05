@@ -26,7 +26,7 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::data::{Channel, ChannelId, GroupData, Message};
+use crate::data::{BodyRange, Channel, ChannelId, GroupData, Message};
 use crate::receipt::Receipt;
 use crate::util::utc_now_timestamp_msec;
 
@@ -135,6 +135,7 @@ impl SignalManager for PresageManager {
         quote_message: Option<&Message>,
         edit_message_timestamp: Option<u64>,
         attachments: Vec<(AttachmentSpec, Vec<u8>)>,
+        body_ranges: Vec<BodyRange>,
     ) -> (Message, oneshot::Receiver<anyhow::Result<()>>) {
         let message: String = crate::emoji::replace_shortcodes(&text).into_owned();
         let has_attachments = !attachments.is_empty();
@@ -150,10 +151,14 @@ impl SignalManager for PresageManager {
         });
         let quote_message = quote.clone().and_then(Message::from_quote).map(Box::new);
 
+        let proto_body_ranges: Vec<presage::proto::BodyRange> =
+            body_ranges.iter().map(From::from).collect();
+
         let mut data_message = DataMessage {
             body: Some(message.clone()),
             quote,
             expire_timer: channel.expire_timer,
+            body_ranges: proto_body_ranges,
             ..Default::default()
         };
 
@@ -267,7 +272,7 @@ impl SignalManager for PresageManager {
             attachments: saved_attachments,
             reactions: Default::default(),
             receipt: Receipt::Sent,
-            body_ranges: Default::default(),
+            body_ranges,
             send_failed: Default::default(),
             edit: edit_message_timestamp,
             edited: edit_message_timestamp.is_some(),
