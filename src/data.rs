@@ -192,20 +192,20 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BodyRange {
+pub struct BodyRange {
     pub(crate) start: u16,
     pub(crate) end: u16,
     pub(crate) value: AssociatedValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum AssociatedValue {
+pub enum AssociatedValue {
     MentionUuid(Uuid),
     Style(Style),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Style {
+pub enum Style {
     #[default]
     None,
     Bold,

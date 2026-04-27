@@ -45,6 +45,7 @@ pub trait SignalManager {
         quote_message: Option<&Message>,
         edit_message_timestamp: Option<u64>,
         attachments: Vec<(AttachmentSpec, Vec<u8>)>,
+        body_ranges: Vec<crate::data::BodyRange>,
     ) -> (Message, oneshot::Receiver<anyhow::Result<()>>);
 
     fn send_reaction(&self, channel: &Channel, message: &Message, emoji: String, remove: bool);

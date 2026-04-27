@@ -11,11 +11,12 @@ use image::codecs::png::PngEncoder;
 use image::{ImageBuffer, ImageEncoder, Rgba};
 use presage::libsignal_service::sender::AttachmentSpec;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::command::{
     Command, DirectionVertical, MoveAmountText, MoveAmountVisual, MoveDirection, Widget, WindowMode,
 };
-use crate::data::{ChannelId, Message};
+use crate::data::{AssociatedValue, BodyRange, ChannelId, Message};
 use crate::storage::MessageId;
 use crate::util::{ATTACHMENT_REGEX, URL_REGEX};
 
@@ -75,6 +76,22 @@ impl App {
                 self.is_multiline_input = !self.is_multiline_input;
             }
             Command::React(reaction) => {
+                // Tab with @partial before cursor: attempt mention completion
+                if reaction.is_none() {
+                    use crate::config::MentionCompletionStyle;
+                    let completed = match self.config.mention_completion {
+                        MentionCompletionStyle::None => false,
+                        MentionCompletionStyle::Readline => self.try_mention_completion(),
+                        MentionCompletionStyle::Cycle => self.try_mention_completion_cycling(),
+                        MentionCompletionStyle::Menu => {
+                            // Menu mode uses the popup, Tab not needed to trigger
+                            false
+                        }
+                    };
+                    if completed {
+                        return Ok(());
+                    }
+                }
                 if let Some(idx) = self.channels.state.selected() {
                     self.add_reaction(idx, reaction).await;
                 }
@@ -117,6 +134,55 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        if key.code != KeyCode::Tab {
+            self.mention_cycle = None;
+        }
+
+        // Handle mention popup if active
+        if self.mention_popup.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mention_popup = None;
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_mention_popup();
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    if let Some(ref mut popup) = self.mention_popup {
+                        let i = popup.state.selected().unwrap_or(0);
+                        if i > 0 {
+                            popup.state.select(Some(i - 1));
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut popup) = self.mention_popup {
+                        let i = popup.state.selected().unwrap_or(0);
+                        if i + 1 < popup.matches.len() {
+                            popup.state.select(Some(i + 1));
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char(c) => {
+                    self.get_input().put_char(c);
+                    self.update_mention_popup();
+                    return Ok(());
+                }
+                KeyCode::Backspace => {
+                    self.get_input().on_backspace();
+                    self.update_mention_popup();
+                    return Ok(());
+                }
+                _ => {
+                    self.mention_popup = None;
+                }
+            }
+        }
+
         if let Some(cmd) = self.event_to_command(&key) {
             self.on_command(cmd.clone()).await?;
         } else {
@@ -154,7 +220,15 @@ impl App {
                 KeyCode::Esc if !self.reset_editing() => {
                     self.reset_message_selection();
                 }
-                KeyCode::Char(c) => self.get_input().put_char(c),
+                KeyCode::Char(c) => {
+                    self.get_input().put_char(c);
+                    if c == '@'
+                        && self.config.mention_completion
+                            == crate::config::MentionCompletionStyle::Menu
+                    {
+                        self.open_mention_popup();
+                    }
+                }
                 _ => {}
             }
         }
@@ -274,6 +348,10 @@ impl App {
             .storage
             .channel(channel_id)
             .expect("non-existent channel");
+        let (input, body_ranges) = self.parse_mentions(&channel, input);
+        if !body_ranges.is_empty() || input.contains("XYZZY") {
+            info!(?input, ?body_ranges, "XYZZY mention parse result");
+        }
         let editing = self.editing.take();
         let quote = editing.is_none().then(|| self.selected_message()).flatten();
         let (sent_message, response) = self.signal_manager.send_text(
@@ -282,6 +360,7 @@ impl App {
             quote.as_deref(),
             editing.map(|id| id.arrived_at),
             attachments,
+            body_ranges,
         );
 
         let message_id = MessageId::new(channel_id, sent_message.arrived_at);
@@ -388,6 +467,428 @@ impl App {
         }
 
         Some(())
+    }
+
+    /// Attempt bash-style tab completion for @mentions.
+    /// Returns true if completion was attempted (even if no match).
+    fn try_mention_completion(&mut self) -> bool {
+        // Find the @ before the cursor
+        let input = &self.input.data;
+        let cursor_byte = self.input.cursor.idx;
+        let before_cursor = &input[..cursor_byte];
+        let at_pos = match before_cursor.rfind('@') {
+            Some(pos) => pos,
+            None => return false,
+        };
+
+        // Must be at start or after whitespace
+        if at_pos > 0 && !before_cursor.as_bytes()[at_pos - 1].is_ascii_whitespace() {
+            return false;
+        }
+
+        let partial = &before_cursor[at_pos + 1..];
+        if partial.is_empty() {
+            self.bell();
+            return true;
+        }
+
+        // Get channel members
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return false,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return false;
+                }
+            }
+        };
+
+        // Find matching names
+        let partial_lower = partial.to_lowercase();
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .filter(|(name, _)| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+
+        if matches.is_empty() {
+            return true; // attempted but no match
+        }
+
+        if matches.len() == 1 {
+            // Unique match: complete and add space
+            let name = &matches[0].0;
+            let completion = &name[partial.len()..];
+            let insert_pos = cursor_byte;
+            self.input.data.insert_str(insert_pos, completion);
+            self.input.data.insert(insert_pos + completion.len(), ' ');
+            for _ in 0..completion.len() + 1 {
+                self.input.on_right();
+            }
+        } else {
+            // Multiple matches: complete to longest common prefix
+            let first = matches[0].0.to_lowercase();
+            let mut prefix_len = first.len();
+            for (name, _) in &matches[1..] {
+                let name_lower = name.to_lowercase();
+                prefix_len = first
+                    .chars()
+                    .zip(name_lower.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+            }
+            if prefix_len > partial.len() {
+                // Can extend the partial
+                let original_name = &matches[0].0;
+                let completion = &original_name[partial.len()..prefix_len];
+                let insert_pos = cursor_byte;
+                self.input.data.insert_str(insert_pos, completion);
+                for _ in 0..completion.len() {
+                    self.input.on_right();
+                }
+            }
+            self.bell();
+        }
+        true
+    }
+
+    fn open_mention_popup(&mut self) {
+        let at_byte_pos = self.input.cursor.idx - 1; // cursor is after the '@'
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return;
+                }
+            }
+        };
+
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .collect();
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0));
+        self.mention_popup = Some(super::MentionPopupState {
+            at_byte_pos,
+            matches,
+            state,
+        });
+    }
+
+    fn update_mention_popup(&mut self) {
+        let Some(ref popup) = self.mention_popup else {
+            return;
+        };
+        let at_pos = popup.at_byte_pos;
+        let cursor_byte = self.input.cursor.idx;
+
+        // Check if cursor is still after the @
+        if cursor_byte <= at_pos {
+            self.mention_popup = None;
+            return;
+        }
+
+        let partial = &self.input.data[at_pos + 1..cursor_byte];
+        let partial_lower = partial.to_lowercase();
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => {
+                self.mention_popup = None;
+                return;
+            }
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => {
+                self.mention_popup = None;
+                return;
+            }
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    self.mention_popup = None;
+                    return;
+                }
+            }
+        };
+
+        let matches: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid), uuid))
+            .filter(|(name, _)| {
+                partial_lower.is_empty() || name.to_lowercase().starts_with(&partial_lower)
+            })
+            .collect();
+
+        if matches.is_empty() {
+            self.mention_popup = None;
+            return;
+        }
+
+        let popup = self.mention_popup.as_mut().unwrap();
+        popup.matches = matches;
+        // Clamp selection
+        if let Some(sel) = popup.state.selected() {
+            if sel >= popup.matches.len() {
+                popup.state.select(Some(popup.matches.len() - 1));
+            }
+        } else {
+            popup.state.select(Some(0));
+        }
+    }
+
+    fn accept_mention_popup(&mut self) {
+        let Some(popup) = self.mention_popup.take() else {
+            return;
+        };
+        let selected = popup.state.selected().unwrap_or(0);
+        if selected >= popup.matches.len() {
+            return;
+        }
+        let (name, _uuid) = &popup.matches[selected];
+        let cursor_byte = self.input.cursor.idx;
+
+        // Replace @partial with @Name and add space
+        let replace_start = popup.at_byte_pos + 1; // after @
+        let name_and_space = format!("{name} ");
+        self.input
+            .data
+            .replace_range(replace_start..cursor_byte, &name_and_space);
+
+        // Move cursor to after the space
+        self.input.cursor.idx = replace_start;
+        self.input.cursor.col = self.input.data[..replace_start].chars().count();
+        for _ in 0..name_and_space.chars().count() {
+            self.input.on_right();
+        }
+    }
+
+    /// Cycling tab completion for @mentions.
+    /// First Tab inserts first match. Subsequent Tabs cycle through matches.
+    fn try_mention_completion_cycling(&mut self) -> bool {
+        let cursor_byte = self.input.cursor.idx;
+        let before_cursor = self.input.data[..cursor_byte].to_string();
+
+        // Check if we're continuing a cycle
+        let cycle_action = self.mention_cycle.as_ref().and_then(|cycle| {
+            let expected_end = cycle.at_byte_pos + 1 + cycle.matches[cycle.index].len();
+            if cursor_byte == expected_end {
+                Some((
+                    cycle.matches[cycle.index].len(),
+                    (cycle.index + 1) % cycle.matches.len(),
+                    cycle.matches[(cycle.index + 1) % cycle.matches.len()].clone(),
+                    cycle.at_byte_pos + 1,
+                ))
+            } else {
+                None
+            }
+        });
+
+        if let Some((old_name_len, new_index, new_name, replace_start)) = cycle_action {
+            let replace_end = replace_start + old_name_len;
+            let col_at_start = before_cursor[..replace_start].chars().count();
+            let new_name_chars = new_name.chars().count();
+
+            self.input
+                .data
+                .replace_range(replace_start..replace_end, &new_name);
+
+            self.input.cursor.idx = replace_start;
+            self.input.cursor.col = col_at_start;
+            for _ in 0..new_name_chars {
+                self.input.on_right();
+            }
+
+            self.mention_cycle.as_mut().unwrap().index = new_index;
+            return true;
+        }
+
+        // Reset cycle if cursor moved
+        if self.mention_cycle.is_some() {
+            self.mention_cycle = None;
+        }
+
+        // Start a new completion
+        let at_pos = match before_cursor.rfind('@') {
+            Some(pos) => pos,
+            None => return false,
+        };
+        if at_pos > 0 && !before_cursor.as_bytes()[at_pos - 1].is_ascii_whitespace() {
+            return false;
+        }
+
+        let partial = &before_cursor[at_pos + 1..];
+
+        let channel_id = match self.channels.selected_item() {
+            Some(id) => *id,
+            None => return false,
+        };
+        let channel = match self.storage.channel(channel_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        let members: Vec<Uuid> = match channel.group_data.as_ref() {
+            Some(gd) => gd.members.clone(),
+            None => {
+                if let ChannelId::User(uuid) = channel.id {
+                    vec![uuid]
+                } else {
+                    return false;
+                }
+            }
+        };
+
+        let partial_lower = partial.to_lowercase();
+        let matches: Vec<String> = members
+            .iter()
+            .map(|&uuid| self.name_by_id_cached(uuid))
+            .filter(|name| name.to_lowercase().starts_with(&partial_lower))
+            .collect();
+
+        if matches.is_empty() {
+            self.bell();
+            return true;
+        }
+
+        // Insert first match
+        let completion = &matches[0][partial.len()..];
+        let comp_len = completion.len();
+        if matches.len() == 1 {
+            // Unique match: complete and add space
+            let to_insert = format!("{completion} ");
+            self.input.data.insert_str(cursor_byte, &to_insert);
+            for _ in 0..to_insert.chars().count() {
+                self.input.on_right();
+            }
+        } else {
+            self.input.data.insert_str(cursor_byte, completion);
+            for _ in 0..comp_len {
+                self.input.on_right();
+            }
+        }
+
+        self.mention_cycle = Some(super::MentionCycleState {
+            at_byte_pos: at_pos,
+            matches,
+            index: 0,
+        });
+
+        true
+    }
+
+    /// Parse @mentions in the input text and replace with placeholder characters.
+    /// Returns the modified text and a list of BodyRanges for the mentions.
+    fn parse_mentions(
+        &self,
+        channel: &crate::data::Channel,
+        input: String,
+    ) -> (String, Vec<BodyRange>) {
+        let members = match channel.group_data.as_ref() {
+            Some(group_data) => &group_data.members,
+            None => {
+                // DM: the only mentionable user is the other party
+                if let ChannelId::User(uuid) = channel.id {
+                    return self.parse_mentions_with_members(&[uuid], input);
+                }
+                return (input, vec![]);
+            }
+        };
+        self.parse_mentions_with_members(members, input)
+    }
+
+    fn parse_mentions_with_members(
+        &self,
+        members: &[Uuid],
+        input: String,
+    ) -> (String, Vec<BodyRange>) {
+        // Build name → UUID map from group members
+        let name_to_uuid: Vec<(String, Uuid)> = members
+            .iter()
+            .map(|&uuid| (self.name_by_id_cached(uuid).to_lowercase(), uuid))
+            .collect();
+
+        let mut result = String::with_capacity(input.len());
+        let mut body_ranges = Vec::new();
+        let mut chars = input.char_indices().peekable();
+        let mut char_pos: u16 = 0;
+
+        while let Some((i, ch)) = chars.next() {
+            if ch == '@' {
+                // Try to match a member name after @
+                let rest = &input[i + 1..];
+                let mut matched = None;
+                for (name, uuid) in &name_to_uuid {
+                    if rest.to_lowercase().starts_with(name.as_str()) {
+                        // Check the char after the name is a boundary
+                        let after = rest.get(name.len()..name.len() + 1);
+                        if after.is_none()
+                            || after.is_some_and(|c| {
+                                c.starts_with(|c: char| {
+                                    c.is_whitespace() || c.is_ascii_punctuation()
+                                })
+                            })
+                        {
+                            matched = Some((name.len(), *uuid));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((name_len, uuid)) = matched {
+                    let start = char_pos;
+                    result.push('\u{FFFC}');
+                    char_pos += 1;
+                    body_ranges.push(BodyRange {
+                        start,
+                        end: char_pos,
+                        value: AssociatedValue::MentionUuid(uuid),
+                    });
+                    // Skip past the matched name in the input
+                    for _ in 0..name_len {
+                        chars.next();
+                    }
+                } else {
+                    result.push(ch);
+                    char_pos += 1;
+                }
+            } else {
+                result.push(ch);
+                char_pos += 1;
+            }
+        }
+
+        (result, body_ranges)
     }
 
     pub fn event_to_command<'r>(&'r self, event: &KeyEvent) -> Option<&'r Command> {
